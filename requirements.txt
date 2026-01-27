@@ -3,3 +3,5 @@ uvicorn
 bip-utils
 websockets
 aiohttp
+mnemonic
+colorama
