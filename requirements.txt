@@ -5,3 +5,4 @@ websockets
 aiohttp
 mnemonic
 colorama
+jinja2
