@@ -12,7 +12,6 @@ from colorama import Fore, init
 app = FastAPI()
 init(autoreset=True)
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,14 +22,15 @@ app.add_middleware(
 
 # --- CONFIG ---
 ENABLE_BTC = True
-ENABLE_ETH = True
+ENABLE_ETH = True # Checks ETH and BNB
 ENABLE_TRX = True
 
 ETH_RPC = "https://eth.llamarpc.com"
+BSC_RPC = "https://bsc-dataseed.binance.org/"
 TRX_API = "https://api.trongrid.io/v1/accounts/{}"
 BTC_API = "https://blockstream.info/api/address/{}"
 
-# --- RATE LIMITER ---
+# --- RATE LIMITER & SESSION CLASSES (Keep same as before) ---
 class RateLimiter:
     def __init__(self, rate_limit: int):
         self.rate_limit = rate_limit
@@ -59,7 +59,6 @@ class RateLimiter:
     
     def set_rate(self, new_rate: int): self.rate_limit = new_rate
 
-# --- USER SESSION ---
 class UserSession:
     def __init__(self, user_id: str, speed: int = 50):
         self.user_id = user_id
@@ -108,27 +107,49 @@ async def user_worker(user_session: UserSession, session: aiohttp.ClientSession,
             if not wallets: continue
 
             tasks = []
+            
+            # 1. BTC
             if ENABLE_BTC: tasks.append(check_balance(session, BTC_API.format(wallets['btc'])))
             else: tasks.append(asyncio.sleep(0))
+            
+            # 2. ETH
             if ENABLE_ETH:
                 payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[wallets['eth'], "latest"],"id":1}
                 tasks.append(check_balance(session, ETH_RPC, "POST", payload))
             else: tasks.append(asyncio.sleep(0))
+            
+            # 3. BNB (Uses ETH Address)
+            if ENABLE_ETH:
+                payload = {"jsonrpc":"2.0","method":"eth_getBalance","params":[wallets['eth'], "latest"],"id":1}
+                tasks.append(check_balance(session, BSC_RPC, "POST", payload))
+            else: tasks.append(asyncio.sleep(0))
+
+            # 4. TRX
             if ENABLE_TRX: tasks.append(check_balance(session, TRX_API.format(wallets['trx'])))
             else: tasks.append(asyncio.sleep(0))
 
             results = await asyncio.gather(*tasks)
             
-            btc_bal = 0; eth_bal = 0; trx_bal = 0; found = False
+            btc_bal = 0; eth_bal = 0; bnb_bal = 0; trx_bal = 0; found = False
 
+            # BTC Check
             if results[0]:
                 btc_bal = (results[0].get('chain_stats', {}).get('funded_txo_sum', 0) - results[0].get('chain_stats', {}).get('spent_txo_sum', 0)) / 100000000
                 if btc_bal > 0: found = True
+            
+            # ETH Check
             if results[1] and "result" in results[1]:
                 eth_bal = int(results[1]["result"], 16) / 10**18
                 if eth_bal > 0: found = True
-            if results[2] and results[2].get('data'):
-                trx_bal = results[2]['data'][0]['balance'] / 1000000
+
+            # BNB Check
+            if results[2] and "result" in results[2]:
+                bnb_bal = int(results[2]["result"], 16) / 10**18
+                if bnb_bal > 0: found = True
+
+            # TRX Check
+            if results[3] and results[3].get('data'):
+                trx_bal = results[3]['data'][0]['balance'] / 1000000
                 if trx_bal > 0: found = True
 
             user_session.attempts += 1
@@ -138,7 +159,7 @@ async def user_worker(user_session: UserSession, session: aiohttp.ClientSession,
                 try:
                     await user_session.socket.send_json({
                         "seedPhrase": phrase,
-                        "btcBalance": btc_bal, "ethBalance": eth_bal, "trxBalance": trx_bal,
+                        "btcBalance": btc_bal, "ethBalance": eth_bal, "bnbBalance": bnb_bal, "trxBalance": trx_bal,
                         "btcAddress": wallets['btc'], "ethAddress": wallets['eth'], "trxAddress": wallets['trx'],
                         "found": found
                     })
@@ -147,12 +168,11 @@ async def user_worker(user_session: UserSession, session: aiohttp.ClientSession,
         except asyncio.CancelledError: break
         except Exception: await asyncio.sleep(0.1)
 
-# --- USER WEBSOCKET (FIXED) ---
+# --- WEBSOCKET ENDPOINT ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session_id = f"user_{int(time.time())}"
-    # Default speed 50 scans/sec
     session_obj = UserSession(session_id, speed=50)
     session_obj.socket = websocket
     active_sessions[session_id] = session_obj
@@ -163,27 +183,22 @@ async def websocket_endpoint(websocket: WebSocket):
         session_obj.tasks = workers
         try:
             while True:
-                # FIXED: Handle JSON speed commands from HTML
                 data = await websocket.receive_text()
                 try:
-                    # Check if it is a JSON command
                     cmd_data = json.loads(data)
                     if cmd_data.get("cmd") == "speed":
                         new_rate = int(cmd_data.get("value", 50))
                         session_obj.limiter.set_rate(new_rate)
                 except:
-                    # Fallback for plain text "stop"
-                    if data == "stop": 
-                        session_obj.active = False
+                    if data == "stop": session_obj.active = False
         except WebSocketDisconnect:
             session_obj.stop()
             if session_id in active_sessions: del active_sessions[session_id]
 
-# --- ADMIN API ---
+# --- ADMIN API ENDPOINTS (Keep existing logic) ---
 @app.post("/admin/start/{user_id}")
 async def start_user(user_id: str, speed: int = 50):
-    if user_id not in active_sessions:
-        active_sessions[user_id] = UserSession(user_id, speed)
+    if user_id not in active_sessions: active_sessions[user_id] = UserSession(user_id, speed)
     return {"status": "started"}
 
 @app.post("/admin/speed/{user_id}")
@@ -192,10 +207,9 @@ async def set_speed(user_id: str, speed: int):
     if not target:
         for uid in active_sessions:
             if user_id in uid: target = active_sessions[uid]
-    
     if target:
         target.limiter.set_rate(speed)
-        return {"status": "updated", "speed": speed}
+        return {"status": "updated"}
     return {"status": "not_found"}
 
 @app.post("/admin/stop/{user_id}")
@@ -204,7 +218,6 @@ async def stop_user(user_id: str):
     if not target_id:
         for uid in active_sessions:
             if user_id in uid: target_id = uid
-            
     if target_id:
         active_sessions[target_id].stop()
         del active_sessions[target_id]
