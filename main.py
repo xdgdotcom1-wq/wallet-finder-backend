@@ -12,10 +12,10 @@ from colorama import Fore, init
 app = FastAPI()
 init(autoreset=True)
 
-# --- CORS (IMPORTANT: Allows your HTML to talk to this API) ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for now (or put your specific domain)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -147,11 +147,12 @@ async def user_worker(user_session: UserSession, session: aiohttp.ClientSession,
         except asyncio.CancelledError: break
         except Exception: await asyncio.sleep(0.1)
 
-# --- USER WEBSOCKET ---
+# --- USER WEBSOCKET (FIXED) ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session_id = f"user_{int(time.time())}"
+    # Default speed 50 scans/sec
     session_obj = UserSession(session_id, speed=50)
     session_obj.socket = websocket
     active_sessions[session_id] = session_obj
@@ -162,23 +163,31 @@ async def websocket_endpoint(websocket: WebSocket):
         session_obj.tasks = workers
         try:
             while True:
+                # FIXED: Handle JSON speed commands from HTML
                 data = await websocket.receive_text()
-                if data == "stop": session_obj.active = False
+                try:
+                    # Check if it is a JSON command
+                    cmd_data = json.loads(data)
+                    if cmd_data.get("cmd") == "speed":
+                        new_rate = int(cmd_data.get("value", 50))
+                        session_obj.limiter.set_rate(new_rate)
+                except:
+                    # Fallback for plain text "stop"
+                    if data == "stop": 
+                        session_obj.active = False
         except WebSocketDisconnect:
             session_obj.stop()
             if session_id in active_sessions: del active_sessions[session_id]
 
-# --- ADMIN API (Used by your HTML) ---
+# --- ADMIN API ---
 @app.post("/admin/start/{user_id}")
 async def start_user(user_id: str, speed: int = 50):
-    # This is for testing or headless nodes
     if user_id not in active_sessions:
         active_sessions[user_id] = UserSession(user_id, speed)
     return {"status": "started"}
 
 @app.post("/admin/speed/{user_id}")
 async def set_speed(user_id: str, speed: int):
-    # Find exact or partial match
     target = active_sessions.get(user_id)
     if not target:
         for uid in active_sessions:
